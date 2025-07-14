@@ -1,5 +1,6 @@
 //Turtle_TRUSTNOONE
 
+
 #include <stdio.h>
 #include <stdbool.h>
 #include <sodium.h>
@@ -31,6 +32,7 @@ typedef struct {
 unsigned char seen_hashes[MAX_HASH_LOG][HASH_SZ];
 int seen_hash_count = 0;
 
+// Serialization helpers
 void write_le32(unsigned char *buf, size_t *offset, uint32_t val) {
     val = htole32(val);
     memcpy(buf + *offset, &val, sizeof(uint32_t));
@@ -42,12 +44,16 @@ void write_le64(unsigned char *buf, size_t *offset, uint64_t val) {
     *offset += sizeof(uint64_t);
 }
 
+// Canonical transaction hash
 bool compute_tx_hash(const Transaction *tx, unsigned char *hash_out) {
     unsigned char *buf = sodium_malloc(512);
-    if (!buf) return false;
-    size_t offset = 0;
+    if (!buf) {
+        fprintf(stderr, "❌ Failed to allocate hash buffer\n");
+        return false;
+    }
 
-    memcpy(buf + offset, &tx->tx_version, sizeof(uint8_t)); offset += sizeof(uint8_t);
+    size_t offset = 0;
+    memcpy(buf + offset, &tx->tx_version, sizeof(tx->tx_version)); offset += sizeof(tx->tx_version);
     memcpy(buf + offset, tx->from_addr, PUBKEY_SZ); offset += PUBKEY_SZ;
     memcpy(buf + offset, tx->to_addr, 32); offset += 32;
     write_le64(buf, &offset, tx->amount_atomic);
@@ -57,6 +63,7 @@ bool compute_tx_hash(const Transaction *tx, unsigned char *hash_out) {
     if (crypto_generichash(hash_out, HASH_SZ, buf, offset, NULL, 0) != 0) {
         sodium_memzero(buf, 512);
         sodium_free(buf);
+        fprintf(stderr, "❌ Hashing failed\n");
         return false;
     }
 
@@ -65,10 +72,12 @@ bool compute_tx_hash(const Transaction *tx, unsigned char *hash_out) {
     return true;
 }
 
+// Truncated txid for audit display
 void txid_from_hash(const unsigned char *hash, unsigned char *txid_out) {
     memcpy(txid_out, hash, TXID_SZ);
 }
 
+// In-memory replay protection
 bool already_seen(const unsigned char *hash) {
     for (int i = 0; i < seen_hash_count; i++) {
         if (sodium_memcmp(seen_hashes[i], hash, HASH_SZ) == 0) return true;
@@ -82,9 +91,13 @@ void log_seen(const unsigned char *hash) {
     }
 }
 
+// Verifies signatures using authorized pubkeys
 bool verify_signatures(const Transaction *tx, const unsigned char authorized_pubkeys[][PUBKEY_SZ],
                        int authorized_count, int required_signers) {
-    if (tx->signature_count < required_signers || tx->signature_count > MAX_SIGNATURES) return false;
+    if (tx->signature_count != required_signers || tx->signature_count > MAX_SIGNATURES) {
+        fprintf(stderr, "❌ Invalid signature count\n");
+        return false;
+    }
 
     unsigned char hash[HASH_SZ];
     if (!compute_tx_hash(tx, hash)) return false;
@@ -104,16 +117,14 @@ bool verify_signatures(const Transaction *tx, const unsigned char authorized_pub
                 break;
             }
         }
-        if (!sig_valid) {
-            sodium_memzero(hash, HASH_SZ);
-            return false;
-        }
+        if (!sig_valid) break;
     }
 
     sodium_memzero(hash, HASH_SZ);
     return valid >= required_signers;
 }
 
+// Full validation pipeline
 bool is_valid(const Transaction *tx, uint32_t current_nonce, uint32_t current_block,
               const unsigned char authorized_pubkeys[][PUBKEY_SZ], int authorized_count, int required_signers) {
 
@@ -123,7 +134,7 @@ bool is_valid(const Transaction *tx, uint32_t current_nonce, uint32_t current_bl
     }
 
     if (tx->expiry + EXPIRY_WINDOW < current_block) {
-        fprintf(stderr, "❌ Expired transaction\n");
+        fprintf(stderr, "❌ Transaction expired\n");
         return false;
     }
 
@@ -133,10 +144,7 @@ bool is_valid(const Transaction *tx, uint32_t current_nonce, uint32_t current_bl
     }
 
     unsigned char hash[HASH_SZ];
-    if (!compute_tx_hash(tx, hash)) {
-        fprintf(stderr, "❌ Hashing failed\n");
-        return false;
-    }
+    if (!compute_tx_hash(tx, hash)) return false;
 
     unsigned char txid[TXID_SZ];
     txid_from_hash(hash, txid);
@@ -158,7 +166,7 @@ bool is_valid(const Transaction *tx, uint32_t current_nonce, uint32_t current_bl
     return true;
 }
 
-// Generate keypair and print base64 public key
+// Prints hex public key
 void print_keypair(unsigned char *pub, unsigned char *priv, const char *label) {
     crypto_sign_keypair(pub, priv);
     printf("🔑 %s public key: ", label);
@@ -172,7 +180,7 @@ int main() {
         return 1;
     }
 
-    printf("🔐 Turtle_TRUSTNOONE full-stack demo initialized\n");
+    printf("🔐 Turtle_TRUSTNOONE audit mode engaged\n");
 
     unsigned char sender_pub[PUBKEY_SZ], sender_priv[PRIVKEY_SZ];
     unsigned char approver_pub[PUBKEY_SZ], approver_priv[PRIVKEY_SZ];
@@ -183,27 +191,22 @@ int main() {
     Transaction tx = {0};
     tx.tx_version = 1;
     memcpy(tx.from_addr, sender_pub, PUBKEY_SZ);
-    memset(tx.to_addr, 0xB, 32); // fake address
+    randombytes_buf(tx.to_addr, 32); // fake recipient
     tx.amount_atomic = 1000000;
     tx.nonce = 7;
     tx.expiry = 500;
     tx.signature_count = 2;
 
     unsigned char hash[HASH_SZ];
-    compute_tx_hash(&tx, hash);
+    if (!compute_tx_hash(&tx, hash)) return 1;
 
-    if (crypto_sign_detached(tx.signatures[0], NULL, hash, HASH_SZ, sender_priv) != 0) {
-        fprintf(stderr, "❌ Sender signature failed\n");
-        return 1;
-    }
-    if (crypto_sign_detached(tx.signatures[1], NULL, hash, HASH_SZ, approver_priv) != 0) {
-        fprintf(stderr, "❌ Approver signature failed\n");
+    if (crypto_sign_detached(tx.signatures[0], NULL, hash, HASH_SZ, sender_priv) != 0 ||
+        crypto_sign_detached(tx.signatures[1], NULL, hash, HASH_SZ, approver_priv) != 0) {
+        fprintf(stderr, "❌ Signature failure\n");
         return 1;
     }
 
-    const unsigned char authorized_keys[2][PUBKEY_SZ] = {
-        {0}, {0}
-    };
+    unsigned char authorized_keys[2][PUBKEY_SZ];
     memcpy(authorized_keys[0], sender_pub, PUBKEY_SZ);
     memcpy(authorized_keys[1], approver_pub, PUBKEY_SZ);
 
@@ -215,4 +218,3 @@ int main() {
 
     return 0;
 }
-
