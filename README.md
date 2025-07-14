@@ -1,2 +1,0 @@
-# Turtlecoin
-0trust
