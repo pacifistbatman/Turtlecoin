@@ -2,10 +2,12 @@
 
 
 #include <stdio.h>
-#include <stdbool.h>
-#include <sodium.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdbool.h>
+#include <time.h>
+#include <sodium.h>
 
 #define PUBKEY_SZ crypto_sign_PUBLICKEYBYTES
 #define PRIVKEY_SZ crypto_sign_SECRETKEYBYTES
@@ -15,6 +17,7 @@
 #define MAX_SIGNATURES 16
 #define EXPIRY_WINDOW 5
 #define MAX_HASH_LOG 256
+#define MAX_TRANSACTIONS_PER_BLOCK 128
 
 #pragma pack(push, 1)
 typedef struct {
@@ -29,10 +32,23 @@ typedef struct {
 } Transaction;
 #pragma pack(pop)
 
-unsigned char seen_hashes[MAX_HASH_LOG][HASH_SZ];
-int seen_hash_count = 0;
+typedef struct {
+    unsigned char prev_block_hash[HASH_SZ];
+    unsigned char merkle_root[HASH_SZ];
+    uint64_t timestamp;
+    uint32_t block_height;
+    uint32_t nonce;
+    unsigned char proposer_pubkey[PUBKEY_SZ];
+    unsigned char signature[SIGNATURE_SZ];
+} BlockHeader;
 
-// Serialization helpers
+typedef struct {
+    BlockHeader header;
+    Transaction transactions[MAX_TRANSACTIONS_PER_BLOCK];
+    size_t tx_count;
+} Block;
+
+// === Helpers endian R ===
 void write_le32(unsigned char *buf, size_t *offset, uint32_t val) {
     val = htole32(val);
     memcpy(buf + *offset, &val, sizeof(uint32_t));
@@ -44,14 +60,10 @@ void write_le64(unsigned char *buf, size_t *offset, uint64_t val) {
     *offset += sizeof(uint64_t);
 }
 
-// Canonical transaction hash
+// === Compute Transaction Hash ===
 bool compute_tx_hash(const Transaction *tx, unsigned char *hash_out) {
     unsigned char *buf = sodium_malloc(512);
-    if (!buf) {
-        fprintf(stderr, "❌ Failed to allocate hash buffer\n");
-        return false;
-    }
-
+    if (!buf) return false;
     size_t offset = 0;
     memcpy(buf + offset, &tx->tx_version, sizeof(tx->tx_version)); offset += sizeof(tx->tx_version);
     memcpy(buf + offset, tx->from_addr, PUBKEY_SZ); offset += PUBKEY_SZ;
@@ -59,46 +71,63 @@ bool compute_tx_hash(const Transaction *tx, unsigned char *hash_out) {
     write_le64(buf, &offset, tx->amount_atomic);
     write_le32(buf, &offset, tx->nonce);
     write_le32(buf, &offset, tx->expiry);
-
-    if (crypto_generichash(hash_out, HASH_SZ, buf, offset, NULL, 0) != 0) {
-        sodium_memzero(buf, 512);
-        sodium_free(buf);
-        fprintf(stderr, "❌ Hashing failed\n");
-        return false;
-    }
-
+    bool res = crypto_generichash(hash_out, HASH_SZ, buf, offset, NULL, 0) == 0;
     sodium_memzero(buf, 512);
     sodium_free(buf);
-    return true;
+    return res;
 }
 
-// Truncated txid for audit display
-void txid_from_hash(const unsigned char *hash, unsigned char *txid_out) {
-    memcpy(txid_out, hash, TXID_SZ);
-}
-
-// In-memory replay protection
-bool already_seen(const unsigned char *hash) {
-    for (int i = 0; i < seen_hash_count; i++) {
-        if (sodium_memcmp(seen_hashes[i], hash, HASH_SZ) == 0) return true;
+// === Comp Merkle Root (simp bin hash tree) ===
+void compute_merkle_root(Transaction *txs, size_t tx_count, unsigned char *out_root) {
+    if (tx_count == 0) {
+        memset(out_root, 0, HASH_SZ);
+        return;
     }
-    return false;
-}
-
-void log_seen(const unsigned char *hash) {
-    if (seen_hash_count < MAX_HASH_LOG) {
-        memcpy(seen_hashes[seen_hash_count++], hash, HASH_SZ);
-    }
-}
-
-// Verifies signatures using authorized pubkeys
-bool verify_signatures(const Transaction *tx, const unsigned char authorized_pubkeys[][PUBKEY_SZ],
-                       int authorized_count, int required_signers) {
-    if (tx->signature_count != required_signers || tx->signature_count > MAX_SIGNATURES) {
-        fprintf(stderr, "❌ Invalid signature count\n");
-        return false;
+    unsigned char hashes[MAX_TRANSACTIONS_PER_BLOCK][HASH_SZ];
+    for (size_t i = 0; i < tx_count; i++) {
+        compute_tx_hash(&txs[i], hashes[i]);
     }
 
+    size_t count = tx_count;
+    while (count > 1) {
+        size_t new_count = (count + 1) / 2;
+        for (size_t i = 0; i < new_count; i++) {
+            unsigned char buf[HASH_SZ * 2];
+            memcpy(buf, hashes[i * 2], HASH_SZ);
+            if (i * 2 + 1 < count) {
+                memcpy(buf + HASH_SZ, hashes[i * 2 + 1], HASH_SZ);
+            } else {
+                memcpy(buf + HASH_SZ, hashes[i * 2], HASH_SZ);
+            }
+            crypto_generichash(hashes[i], HASH_SZ, buf, HASH_SZ * 2, NULL, 0);
+        }
+        count = new_count;
+    }
+    memcpy(out_root, hashes[0], HASH_SZ);
+}
+
+// === Comp Blockhead Hash ===
+bool compute_block_hash(const BlockHeader *header, unsigned char *out_hash) {
+    unsigned char buf[512];
+    size_t offset = 0;
+    memcpy(buf + offset, header->prev_block_hash, HASH_SZ); offset += HASH_SZ;
+    memcpy(buf + offset, header->merkle_root, HASH_SZ); offset += HASH_SZ;
+    write_le64(buf, &offset, header->timestamp);
+    write_le32(buf, &offset, header->block_height);
+    write_le32(buf, &offset, header->nonce);
+    memcpy(buf + offset, header->proposer_pubkey, PUBKEY_SZ); offset += PUBKEY_SZ;
+    return crypto_generichash(out_hash, HASH_SZ, buf, offset, NULL, 0) == 0;
+}
+
+// === Val inst Trans ===
+bool is_valid(const Transaction *tx, uint32_t current_nonce, uint32_t current_block,
+              const unsigned char authorized_pubkeys[][PUBKEY_SZ], int authorized_count, int required_signers) {
+    // Basic checks: nonce, exp, val
+    if (tx->nonce != current_nonce + 1) return false;
+    if (tx->expiry + EXPIRY_WINDOW < current_block) return false;
+    if (tx->amount_atomic == 0 || tx->amount_atomic > UINT64_MAX / 2) return false;
+
+    // Gen hash & auth sigs
     unsigned char hash[HASH_SZ];
     if (!compute_tx_hash(tx, hash)) return false;
 
@@ -117,104 +146,125 @@ bool verify_signatures(const Transaction *tx, const unsigned char authorized_pub
                 break;
             }
         }
-        if (!sig_valid) break;
+        if (!sig_valid) return false;
     }
-
-    sodium_memzero(hash, HASH_SZ);
     return valid >= required_signers;
 }
 
-// Full validation pipeline
-bool is_valid(const Transaction *tx, uint32_t current_nonce, uint32_t current_block,
-              const unsigned char authorized_pubkeys[][PUBKEY_SZ], int authorized_count, int required_signers) {
-
-    if (tx->nonce != current_nonce + 1) {
-        fprintf(stderr, "❌ Nonce mismatch\n");
+// === Validate Block ===
+bool validate_block(const Block *block, const unsigned char *expected_prev_hash,
+                    const unsigned char authorized_validators[][PUBKEY_SZ], int validator_count) {
+    // Check prev hash
+    if (memcmp(block->header.prev_block_hash, expected_prev_hash, HASH_SZ) != 0) {
+        fprintf(stderr, "❌ Previous hash mismatch\n");
         return false;
     }
 
-    if (tx->expiry + EXPIRY_WINDOW < current_block) {
-        fprintf(stderr, "❌ Transaction expired\n");
+    // Ver proposer = auth
+    bool authorized = false;
+    for (int i = 0; i < validator_count; i++) {
+        if (memcmp(block->header.proposer_pubkey, authorized_validators[i], PUBKEY_SZ) == 0) {
+            authorized = true;
+            break;
+        }
+    }
+    if (!authorized) {
+        fprintf(stderr, "❌ Unauthorized proposer\n");
         return false;
     }
 
-    if (tx->amount_atomic == 0 || tx->amount_atomic > UINT64_MAX / 2) {
-        fprintf(stderr, "❌ Invalid amount\n");
+    // Ver block sig
+    unsigned char block_hash[HASH_SZ];
+    if (!compute_block_hash(&block->header, block_hash)) return false;
+    if (crypto_sign_verify_detached(block->header.signature, block_hash, HASH_SZ, block->header.proposer_pubkey) != 0) {
+        fprintf(stderr, "❌ Invalid block signature\n");
         return false;
     }
 
-    unsigned char hash[HASH_SZ];
-    if (!compute_tx_hash(tx, hash)) return false;
-
-    unsigned char txid[TXID_SZ];
-    txid_from_hash(hash, txid);
-    printf("🔎 txid: ");
-    for (int i = 0; i < TXID_SZ; i++) printf("%02X", txid[i]);
-    printf("\n");
-
-    if (already_seen(hash)) {
-        fprintf(stderr, "⚠️ Replay detected\n");
+    // Ver Merkle root
+    unsigned char merkle_root[HASH_SZ];
+    compute_merkle_root((Transaction *)block->transactions, block->tx_count, merkle_root);
+    if (memcmp(merkle_root, block->header.merkle_root, HASH_SZ) != 0) {
+        fprintf(stderr, "❌ Merkle root mismatch\n");
         return false;
     }
 
-    if (!verify_signatures(tx, authorized_pubkeys, authorized_count, required_signers)) {
-        fprintf(stderr, "❌ Signature validation failed\n");
-        return false;
+    // Val trans (example w dummy nonce, replace with real state)
+    uint32_t last_nonce = 0;
+    uint32_t current_block_height = block->header.block_height;
+    for (size_t i = 0; i < block->tx_count; i++) {
+        if (!is_valid(&block->transactions[i], last_nonce, current_block_height,
+                      authorized_validators, validator_count, 2)) {
+            fprintf(stderr, "❌ Transaction %zu invalid\n", i);
+            return false;
+        }
+        last_nonce = block->transactions[i].nonce;
     }
 
-    log_seen(hash);
     return true;
 }
 
-// Prints hex public key
-void print_keypair(unsigned char *pub, unsigned char *priv, const char *label) {
-    crypto_sign_keypair(pub, priv);
-    printf("🔑 %s public key: ", label);
-    for (int i = 0; i < PUBKEY_SZ; i++) printf("%02X", pub[i]);
-    printf("\n");
+// === Simplified ledger persistence (append block to file) ===
+bool save_block(const Block *block, const char *filename) {
+    FILE *f = fopen(filename, "ab");
+    if (!f) return false;
+    fwrite(&block->header, sizeof(BlockHeader), 1, f);
+    fwrite(block->transactions, sizeof(Transaction), block->tx_count, f);
+    fclose(f);
+    return true;
 }
 
+// === Ex. Main Flow ===
 int main() {
     if (sodium_init() < 0) {
-        fprintf(stderr, "🧂 libsodium init failed\n");
+        fprintf(stderr, "libsodium init failed\n");
         return 1;
     }
 
-    printf("🔐 Turtle_TRUSTNOONE audit mode engaged\n");
+    printf("🔐 Blockchain node starting...\n");
 
-    unsigned char sender_pub[PUBKEY_SZ], sender_priv[PRIVKEY_SZ];
-    unsigned char approver_pub[PUBKEY_SZ], approver_priv[PRIVKEY_SZ];
+    // Setup keys for two auth validators
+    unsigned char validator1_pub[PUBKEY_SZ], validator1_priv[PRIVKEY_SZ];
+    unsigned char validator2_pub[PUBKEY_SZ], validator2_priv[PRIVKEY_SZ];
+    crypto_sign_keypair(validator1_pub, validator1_priv);
+    crypto_sign_keypair(validator2_pub, validator2_priv);
 
-    print_keypair(sender_pub, sender_priv, "Sender");
-    print_keypair(approver_pub, approver_priv, "Approver");
+    unsigned char authorized_validators[2][PUBKEY_SZ];
+    memcpy(authorized_validators[0], validator1_pub, PUBKEY_SZ);
+    memcpy(authorized_validators[1], validator2_pub, PUBKEY_SZ);
 
+    // Create genesis block with dummy prev hash of zips
+    Block genesis = {0};
+    memset(genesis.header.prev_block_hash, 0, HASH_SZ);
+    genesis.header.block_height = 0;
+    genesis.header.timestamp = (uint64_t)time(NULL);
+    genesis.header.nonce = 0;
+    memcpy(genesis.header.proposer_pubkey, validator1_pub, PUBKEY_SZ);
+    genesis.tx_count = 0;
+    compute_merkle_root(genesis.transactions, 0, genesis.header.merkle_root);
+
+    unsigned char genesis_hash[HASH_SZ];
+    compute_block_hash(&genesis.header, genesis_hash);
+    crypto_sign_detached(genesis.header.signature, NULL, genesis_hash, HASH_SZ, validator1_priv);
+
+    if (!validate_block(&genesis, genesis.header.prev_block_hash, authorized_validators, 2)) {
+        fprintf(stderr, "Genesis block validation failed\n");
+        return 1;
+    }
+    save_block(&genesis, "blockchain.dat");
+    printf("✅ Genesis block created and saved\n");
+
+    // Spawn new block w/ transactions
+    Block new_block = {0};
+    memcpy(new_block.header.prev_block_hash, genesis_hash, HASH_SZ);
+    new_block.header.block_height = 1;
+    new_block.header.timestamp = (uint64_t)time(NULL);
+    memcpy(new_block.header.proposer_pubkey, validator2_pub, PUBKEY_SZ);
+
+    // Create a dummy trans
     Transaction tx = {0};
     tx.tx_version = 1;
-    memcpy(tx.from_addr, sender_pub, PUBKEY_SZ);
-    randombytes_buf(tx.to_addr, 32); // fake recipient
+    memcpy(tx.from_addr, validator1_pub, PUBKEY_SZ);
+    randombytes_buf(tx.to_addr, 32);
     tx.amount_atomic = 1000000;
-    tx.nonce = 7;
-    tx.expiry = 500;
-    tx.signature_count = 2;
-
-    unsigned char hash[HASH_SZ];
-    if (!compute_tx_hash(&tx, hash)) return 1;
-
-    if (crypto_sign_detached(tx.signatures[0], NULL, hash, HASH_SZ, sender_priv) != 0 ||
-        crypto_sign_detached(tx.signatures[1], NULL, hash, HASH_SZ, approver_priv) != 0) {
-        fprintf(stderr, "❌ Signature failure\n");
-        return 1;
-    }
-
-    unsigned char authorized_keys[2][PUBKEY_SZ];
-    memcpy(authorized_keys[0], sender_pub, PUBKEY_SZ);
-    memcpy(authorized_keys[1], approver_pub, PUBKEY_SZ);
-
-    if (is_valid(&tx, 6, 499, authorized_keys, 2, 2)) {
-        printf("✅ Transaction is valid\n");
-    } else {
-        printf("❌ Transaction failed validation\n");
-    }
-
-    return 0;
-}
+    tx.nonce = 1;
